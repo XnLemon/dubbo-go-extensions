@@ -12,6 +12,8 @@ Community-maintained extensions for Apache Dubbo-Go v3.
 
 ### Registries
 
+- **[etcdv3](./registry/etcdv3/)** - Etcd v3 registry and service discovery
+
 ### Config Centers
 
 ## Usage

@@ -12,6 +12,8 @@
 
 ### 注册中心 (Registries)
 
+- **[etcdv3](./registry/etcdv3/)** - Etcd v3 注册中心与服务发现
+
 ### 配置中心 (Config Centers)
 
 ## 使用方法
