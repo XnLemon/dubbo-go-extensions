@@ -15,148 +15,73 @@
  * limitations under the License.
  */
 
-// Package hystrix provides hystrix filter.
-// To use hystrix, you need to configure commands using hystrix-go API:
-//
-//	import "github.com/afex/hystrix-go/hystrix"
-//
-//	// Resource name format: dubbo:consumer:InterfaceName:group:version:Method
-//	// Example: dubbo:consumer:com.example.GreetService:::Greet
-//	hystrix.ConfigureCommand("dubbo:consumer:com.example.GreetService:::Greet", hystrix.CommandConfig{
-//	    Timeout:                1000,
-//	    MaxConcurrentRequests:  20,
-//	    RequestVolumeThreshold: 20,
-//	    SleepWindow:            5000,
-//	    ErrorPercentThreshold:  50,
-//	})
-
+// Package hystrix provides a typed, resource-aware Hystrix extension.
 package hystrix
 
 import (
 	"context"
-	"fmt"
-	"strings"
 )
 
 import (
-	"dubbo.apache.org/dubbo-go/v3/common"
-	"dubbo.apache.org/dubbo-go/v3/common/constant"
-	"dubbo.apache.org/dubbo-go/v3/common/extension"
-	"dubbo.apache.org/dubbo-go/v3/filter"
 	"dubbo.apache.org/dubbo-go/v3/protocol/base"
 	"dubbo.apache.org/dubbo-go/v3/protocol/result"
 
-	"github.com/afex/hystrix-go/hystrix"
+	afexhystrix "github.com/afex/hystrix-go/hystrix"
 
 	"github.com/dubbogo/gost/log/logger"
 )
 
-const (
-	// Filter keys
-	HystrixConsumerFilterKey = "hystrix_consumer"
-	HystrixProviderFilterKey = "hystrix_provider"
-
-	// Prefixes for resource naming
-	DefaultProviderPrefix = "dubbo:provider:"
-	DefaultConsumerPrefix = "dubbo:consumer:"
-)
-
-func init() {
-	extension.SetFilter(HystrixConsumerFilterKey, newFilterConsumer)
-	extension.SetFilter(HystrixProviderFilterKey, newFilterProvider)
-}
-
-// FilterError implements error interface
+// FilterError reports a Hystrix fallback and whether the circuit was open.
 type FilterError struct {
 	err         error
 	circuitOpen bool
 }
 
-func (hfError *FilterError) Error() string {
-	return hfError.err.Error()
-}
+func (e *FilterError) Error() string     { return e.err.Error() }
+func (e *FilterError) Unwrap() error     { return e.err }
+func (e *FilterError) CircuitOpen() bool { return e.circuitOpen }
 
-// CircuitOpen returns whether the circuit is open
-func (hfError *FilterError) CircuitOpen() bool {
-	return hfError.circuitOpen
-}
-
-// NewHystrixFilterError return a FilterError instance
 func NewHystrixFilterError(err error, circuitOpen bool) error {
-	return &FilterError{
-		err:         err,
-		circuitOpen: circuitOpen,
-	}
+	return &FilterError{err: err, circuitOpen: circuitOpen}
 }
 
-// Filter for Hystrix
+// Filter applies the resource-local Hystrix runtime selected during Dial or
+// Register. Method-level settings are resolved on first invocation.
 type Filter struct {
-	isConsumer bool // true for consumer, false for provider
+	runtime *resourceRuntime
 }
 
-// Invoke is an implementation of filter, provides Hystrix pattern latency and fault tolerance
 func (f *Filter) Invoke(ctx context.Context, invoker base.Invoker, invocation base.Invocation) result.Result {
-	cmdName := getResourceName(invoker, invocation, f.isConsumer)
-
-	var res result.Result
-	err := hystrix.Do(cmdName, func() error {
-		res = invoker.Invoke(ctx, invocation)
-		return res.Error()
-	}, func(err error) error {
-		// Return fallback error
-		_, isCircuitOpen := err.(hystrix.CircuitError)
-		if isCircuitOpen {
-			logger.Debugf("[Hystrix Filter] Circuit opened for %s", cmdName)
-		} else {
-			logger.Debugf("[Hystrix Filter] Hystrix fallback for %s: %v", cmdName, err)
-		}
-		res = &result.RPCResult{}
-		res.SetResult(nil)
-		res.SetError(NewHystrixFilterError(err, isCircuitOpen))
-		return err
-	})
-
+	command, err := f.runtime.command(invocation.MethodName())
 	if err != nil {
-		return res
-	}
-	return res
-}
-
-// OnResponse dummy process, returns the result directly
-func (f *Filter) OnResponse(ctx context.Context, result result.Result, invoker base.Invoker, invocation base.Invocation) result.Result {
-	return result
-}
-
-// newFilterConsumer returns Filter instance for consumer
-func newFilterConsumer() filter.Filter {
-	return &Filter{isConsumer: true}
-}
-
-// newFilterProvider returns Filter instance for provider
-func newFilterProvider() filter.Filter {
-	return &Filter{isConsumer: false}
-}
-
-func getResourceName(invoker base.Invoker, invocation base.Invocation, isConsumer bool) string {
-	var sb strings.Builder
-
-	if isConsumer {
-		sb.WriteString(DefaultConsumerPrefix)
-	} else {
-		sb.WriteString(DefaultProviderPrefix)
+		response := &result.RPCResult{}
+		response.SetError(err)
+		return response
 	}
 
-	// Format: interface:group:version:method
-	sb.WriteString(getColonSeparatedKey(invoker.GetURL()))
-	sb.WriteString(":")
-	sb.WriteString(invocation.MethodName())
-
-	return sb.String()
+	responses := make(chan result.Result, 1)
+	err = afexhystrix.DoC(ctx, command.name, func(runCtx context.Context) error {
+		response := invoker.Invoke(runCtx, invocation)
+		responses <- response
+		if response == nil {
+			return nil
+		}
+		return response.Error()
+	}, nil)
+	if err != nil {
+		_, circuitOpen := err.(afexhystrix.CircuitError)
+		if circuitOpen {
+			logger.Debugf("[Hystrix Filter] circuit opened for %s", command.name)
+		} else {
+			logger.Debugf("[Hystrix Filter] fallback for %s: %v", command.name, err)
+		}
+		response := &result.RPCResult{}
+		response.SetError(NewHystrixFilterError(err, circuitOpen))
+		return response
+	}
+	return <-responses
 }
 
-func getColonSeparatedKey(url *common.URL) string {
-	return fmt.Sprintf("%s:%s:%s",
-		url.Service(),
-		url.GetParam(constant.GroupKey, ""),
-		url.GetParam(constant.VersionKey, ""))
+func (f *Filter) OnResponse(_ context.Context, response result.Result, _ base.Invoker, _ base.Invocation) result.Result {
+	return response
 }
